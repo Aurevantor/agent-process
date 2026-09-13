@@ -88,6 +88,25 @@ and [GPT-5.6 Luna's reasoning and workload guidance](https://developers.openai.c
 an assurance of task success. Re-evaluate it when model versions or access
 conditions change.
 
+## User approval before delegation and after denial
+
+- If automatic approval review is likely to deny the delegation (for example,
+  private repository source or sensitive configuration will be sent to another
+  model), ask the user **before execution**. State the data scope, destination
+  provider/model, purpose, and permitted side effects. General permission to use
+  this skill is not necessarily permission to send that payload; read-only mode
+  does not prevent data from being sent to the model.
+- If the action receives `Automatic approval review denied`, stop that action,
+  explain the denial and risk, and ask the user for explicit approval of the
+  stated scope before retrying. Continue unaffected work where possible.
+- Once the user approves, resubmit the scoped action through the normal approval
+  flow and include that approval in the justification. Do not bypass the denial
+  with another tool, wrapper, identity, or destination. User approval does not
+  override higher-priority restrictions or guarantee that review will allow it.
+- Reuse explicit approval only within its stated scope. If review denies the
+  approved retry again, report the remaining blocker and ask for direction;
+  do not loop through retries or repeated identical approval requests.
+
 ## Safety and handoff
 
 - The wrapper defaults to `--mode read-only` and `--ephemeral`.
