@@ -9,7 +9,10 @@ keeps command construction and execution testable.
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
+import shlex
 import signal
 import stat
 import subprocess
@@ -19,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import TextIO
 
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 DEFAULT_MODEL = "codex-spar"
 DEFAULT_CODEX_BIN = "codex"
 DEFAULT_SANDBOX = "read-only"
@@ -29,6 +32,74 @@ EXIT_NESTED = 125
 NESTING_ENV = "AGENT_PROCESS_NESTING"
 NESTING_MARKER = "1"
 PROCESS_GROUP_GRACE_SECONDS = 0.25
+
+
+@dataclass(frozen=True)
+class UsageLimitDetails:
+    """Usage-limit information extracted from a Codex stderr response."""
+
+    limit: str = "unknown"
+    reset_at: str | None = None
+    reset_hint: str | None = None
+
+
+_USAGE_LIMIT_RE = re.compile(
+    r"(?:"
+    r"\b(?:usage|message|request|quota|credit|token|rate|weekly|week|"
+    r"5\s*[-_ ]?\s*(?:h|hour)s?|five\s*[-_ ]?\s*hours?|"
+    r"7\s*[-_ ]?\s*(?:day|d)s?)\s*[-_ ]*limits?\b"
+    r"|(?:5\s*時間|(?:週間|週)|(?:使用|利用)(?:量)?)[^\n]{0,20}(?:制限|上限)"
+    r"|\blimits?\s+(?:has\s+been\s+)?(?:reached|exceeded|hit|exhausted)\b"
+    r"|\b(?:too\s+many\s+requests|quota\s+exceeded|credits?\s+exhausted)\b"
+    r"|\bout\s+of\s+(?:credits?|messages?|requests?|usage)\b"
+    r")",
+    re.IGNORECASE,
+)
+_FIVE_HOUR_RE = re.compile(
+    r"(?:\b(?:5\s*[-_ ]?\s*(?:h|hour)s?|five\s*[-_ ]?\s*hours?)\b|5\s*時間)",
+    re.IGNORECASE,
+)
+_WEEKLY_RE = re.compile(
+    r"(?:\b(?:weekly|week|7\s*[-_ ]?\s*(?:day|d)s?|seven\s*[-_ ]?\s*days?)\b|週間|週)",
+    re.IGNORECASE,
+)
+_RESET_DATETIME_RE = re.compile(
+    r"(?<!\d)"
+    r"(\d{4}[/-]\d{1,2}[/-]\d{1,2}[T ]\d{1,2}:\d{2}"
+    r"(?::\d{2}(?:\.\d+)?)?"
+    r"(?:\s*(?:Z|UTC|[+-]\d{2}:?\d{2}))?)"
+    r"(?!\d)",
+    re.IGNORECASE,
+)
+_RESET_NATURAL_DATETIME_RE = re.compile(
+    r"\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|"
+    r"Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|"
+    r"Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},?\s+\d{4}"
+    r"(?:,|\s)+(?:at\s+)?\d{1,2}:\d{2}\s*(?:AM|PM)"
+    r"(?:\s+[A-Z]{2,5})?\b",
+    re.IGNORECASE,
+)
+_RESET_TIME_HINT_RE = re.compile(
+    r"(?:\b(?:reset(?:s|ting)?|available|try\s+again|unlock(?:s|ed)?)|リセット|再試行|再度試す)"
+    r"[^\n]{0,40}?\b(?:at|on)?\s*[:\-]?\s*"
+    r"(\d{1,2}:\d{2}(?:\s*[AP]M)?)\b",
+    re.IGNORECASE,
+)
+_JSON_USAGE_KEYS = {
+    "usage_limit",
+    "usage-limit",
+    "usagelimit",
+    "limit_type",
+    "limittype",
+    "reset_at",
+    "resetat",
+    "resets_at",
+    "resetsat",
+}
+_NORMALIZED_JSON_USAGE_KEYS = {
+    key.replace("-", "").replace("_", "") for key in _JSON_USAGE_KEYS
+}
+
 
 @dataclass(frozen=True)
 class ModelPreset:
@@ -133,6 +204,123 @@ class RunConfig:
     timeout: float | None = None
 
 
+def _coerce_text(value: object) -> str:
+    """Convert captured subprocess output to text without raising."""
+
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return ""
+
+
+def _classify_limit(text: str) -> str:
+    """Classify a limit only when exactly one known window is mentioned."""
+
+    matches: list[str] = []
+    if _FIVE_HOUR_RE.search(text):
+        matches.append("5h")
+    if _WEEKLY_RE.search(text):
+        matches.append("weekly")
+    return matches[0] if len(matches) == 1 else "unknown"
+
+
+def _extract_reset_at(text: str) -> str | None:
+    for pattern in (_RESET_DATETIME_RE, _RESET_NATURAL_DATETIME_RE):
+        match = pattern.search(text)
+        if match is not None:
+            return match.group(1) if pattern is _RESET_DATETIME_RE else match.group(0)
+    return None
+
+
+def _extract_reset_hint(text: str) -> str | None:
+    match = _RESET_TIME_HINT_RE.search(text)
+    if match is None:
+        return None
+    return re.sub(r"\s+", " ", match.group(1)).strip()
+
+
+def _iter_json_objects(value: object):
+    if isinstance(value, Mapping):
+        yield value
+        for child in value.values():
+            yield from _iter_json_objects(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_json_objects(child)
+
+
+def _json_usage_details(text: str) -> UsageLimitDetails | None:
+    """Read a structured limit error when Codex emits JSON on stderr."""
+
+    for line in text.splitlines():
+        candidate = line.strip()
+        if not candidate or candidate[0] not in "[{":
+            continue
+        try:
+            parsed = json.loads(candidate)
+        except (TypeError, ValueError):
+            continue
+        for item in _iter_json_objects(parsed):
+            serialized = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+            normalized_keys = {
+                str(key).casefold().replace("-", "").replace("_", "")
+                for key in item
+            }
+            has_limit_key = bool(normalized_keys & _NORMALIZED_JSON_USAGE_KEYS)
+            if not _USAGE_LIMIT_RE.search(serialized) and not has_limit_key:
+                continue
+
+            reset_value = None
+            for key in (
+                "reset_at",
+                "resetAt",
+                "resets_at",
+                "resetsAt",
+                "reset_time",
+                "resetTime",
+            ):
+                if key in item:
+                    reset_value = _coerce_text(item[key])
+                    break
+            reset_at = _extract_reset_at(reset_value or serialized)
+            reset_hint = None if reset_at is not None else _extract_reset_hint(
+                f"reset at {reset_value}" if reset_value else serialized
+            )
+            return UsageLimitDetails(
+                limit=_classify_limit(serialized),
+                reset_at=reset_at,
+                reset_hint=reset_hint,
+            )
+    return None
+
+
+def detect_usage_limit(stderr_text: str) -> UsageLimitDetails | None:
+    """Extract bounded usage-limit metadata from backend stderr.
+
+    This intentionally parses only backend stderr.  Prompts and source files
+    are never part of the input, and an incomplete time-only hint is not
+    promoted to a guessed calendar timestamp.
+    """
+
+    text = _coerce_text(stderr_text)
+    if not text.strip():
+        return None
+
+    structured = _json_usage_details(text)
+    if structured is not None:
+        return structured
+    if not _USAGE_LIMIT_RE.search(text):
+        return None
+
+    reset_at = _extract_reset_at(text)
+    return UsageLimitDetails(
+        limit=_classify_limit(text),
+        reset_at=reset_at,
+        reset_hint=None if reset_at is not None else _extract_reset_hint(text),
+    )
+
+
 def resolve_model(value: str) -> str:
     """Resolve a friendly preset name, or return a raw model name."""
 
@@ -204,7 +392,8 @@ def create_parser() -> argparse.ArgumentParser:
         epilog=(
             "MODEL may be codex-spar, luna-max, or any raw Codex model name. "
             "With no PROMPT, or with PROMPT '-', stdin is used. "
-            "Nested runs exit 125; timeouts exit 124; missing requested output exits 123."
+            "Nested runs exit 125; timeouts exit 124; missing requested output exits 123. "
+            "Recognized backend usage limits are described on stderr with event=usage-limit."
         ),
     )
     parser.add_argument("prompt", nargs="*", metavar="PROMPT")
@@ -363,12 +552,18 @@ def _timeout_label(timeout: float | None) -> str:
     return "none" if timeout is None else f"{timeout:g}s"
 
 
+def _diagnostic_value(value: str) -> str:
+    sanitized = value.replace("\r", r"\r").replace("\n", r"\n")
+    return shlex.quote(sanitized)
+
+
 def _emit_diagnostic(
     config: RunConfig,
     event: str,
     *,
     final_message: str | None = None,
     returncode: int | None = None,
+    details: Mapping[str, str] | None = None,
 ) -> None:
     """Emit bounded failure metadata without copying prompt or source data."""
 
@@ -383,6 +578,11 @@ def _emit_diagnostic(
         fields += (f"final_message={final_message}",)
     if returncode is not None:
         fields += (f"returncode={returncode}",)
+    if details is not None:
+        fields += tuple(
+            f"{key}={_diagnostic_value(value)}"
+            for key, value in details.items()
+        )
     print(f"agent-process: {' '.join(fields)}", file=sys.stderr)
 
 
@@ -402,6 +602,10 @@ def _child_environment() -> dict[str, str]:
 def _popen_options(config: RunConfig) -> dict[str, object]:
     options: dict[str, object] = {
         "stdin": subprocess.PIPE,
+        # Keep stdout inherited so Codex's normal output and JSONL event
+        # stream remain usable by the caller.  stderr is captured only long
+        # enough to classify a backend usage-limit failure, then relayed.
+        "stderr": subprocess.PIPE,
         "text": True,
         "cwd": config.cwd,
         "env": _child_environment(),
@@ -490,6 +694,33 @@ def _close_process_stdin(process: subprocess.Popen[str]) -> None:
         pass
 
 
+def _close_process_stderr(process: subprocess.Popen[str]) -> None:
+    stream = process.stderr
+    if stream is None:
+        return
+    try:
+        stream.close()
+    except (OSError, ValueError):
+        pass
+
+
+def _stderr_from_communicate(result: object) -> str:
+    if not isinstance(result, tuple) or len(result) < 2:
+        return ""
+    return _coerce_text(result[1])
+
+
+def _relay_backend_stderr(stderr_text: str) -> None:
+    """Preserve the backend error for the caller without putting it in stdout."""
+
+    if not stderr_text:
+        return
+    sys.stderr.write(stderr_text)
+    if not stderr_text.endswith("\n"):
+        sys.stderr.write("\n")
+    sys.stderr.flush()
+
+
 def _output_snapshot(path: str | None) -> tuple[int, int, int, int, bool] | None:
     """Capture enough metadata to reject an unchanged, stale output file."""
 
@@ -519,9 +750,26 @@ def _normal_exit_status(
     config: RunConfig,
     returncode: int,
     output_before: tuple[int, int, int, int, bool] | None,
+    stderr_text: str = "",
 ) -> int:
     if returncode != 0 or config.output_last_message is None:
         if returncode != 0:
+            usage_limit = detect_usage_limit(stderr_text)
+            if usage_limit is not None:
+                details = {
+                    "source": "stderr",
+                    "limit": usage_limit.limit,
+                    "reset_at": usage_limit.reset_at or "unknown",
+                }
+                if usage_limit.reset_hint is not None:
+                    details["reset_hint"] = usage_limit.reset_hint
+                _emit_diagnostic(
+                    config,
+                    "usage-limit",
+                    returncode=returncode,
+                    details=details,
+                )
+                return returncode
             _emit_diagnostic(
                 config,
                 "backend-exit",
@@ -556,13 +804,26 @@ def run_process(config: RunConfig, prompt: str) -> int:
         return 126
 
     try:
-        process.communicate(input=prompt, timeout=config.timeout)
-    except subprocess.TimeoutExpired:
+        communication = process.communicate(input=prompt, timeout=config.timeout)
+        stderr_text = _stderr_from_communicate(communication)
+    except subprocess.TimeoutExpired as error:
+        stderr_text = _coerce_text(getattr(error, "stderr", None))
         _terminate_process(process)
+        # Drain only for a bounded grace period.  A detached descendant must
+        # never make a timeout wait forever just because it inherited stderr.
+        try:
+            communication = process.communicate(timeout=PROCESS_GROUP_GRACE_SECONDS)
+        except (BrokenPipeError, OSError, ValueError, subprocess.TimeoutExpired):
+            pass
+        else:
+            stderr_text = _stderr_from_communicate(communication) or stderr_text
+        _relay_backend_stderr(stderr_text)
         _close_process_stdin(process)
+        _close_process_stderr(process)
         _emit_diagnostic(config, "timeout", final_message="absent")
         return EXIT_TIMEOUT
 
+    _relay_backend_stderr(stderr_text)
     returncode = process.returncode
     if returncode is None:
         # Popen.communicate() normally waits, but keep mocked/custom Popen
@@ -570,7 +831,7 @@ def run_process(config: RunConfig, prompt: str) -> int:
         returncode = process.wait()
     if returncode < 0:
         returncode = 128 + (-returncode)
-    return _normal_exit_status(config, returncode, output_before)
+    return _normal_exit_status(config, returncode, output_before, stderr_text)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

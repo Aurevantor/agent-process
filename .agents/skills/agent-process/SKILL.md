@@ -125,11 +125,21 @@ conditions change.
   changed during this invocation. Missing or unchanged output returns `123`
   with `final_message=absent`; an old file must not be reused. Timeout and
   nested rejection likewise never certify an output file.
+- Backend stdout remains attached to the caller so normal text and `--json`
+  JSONL events are not rewritten. Backend stderr is relayed after the process
+  exits. When a non-zero backend exit contains a recognizable usage-limit
+  error, stderr also receives a bounded diagnostic such as
+  `event=usage-limit ... source=stderr limit=5h reset_at=... returncode=<backend-status>`.
+  `limit` is `5h`, `weekly`, or `unknown`; a complete reset timestamp is
+  copied to `reset_at`, while a time-only value is kept as `reset_hint` and
+  `reset_at=unknown` so the wrapper never invents a date or timezone.
 - Timeout, nested rejection, and missing-artifact diagnostics are written to
   stderr with `event`, wrapper `version`, resolved `model`, `sandbox`, and
   `timeout` fields. Prompts and source contents are not copied into these
-  diagnostics. Treat a non-zero status or `final_message=absent` as a failed
-  delegation, even if a partial log or an older output file exists.
+  diagnostics. Usage-limit detection is a compatibility parser for Codex
+  error text/JSON, not a promise of an undocumented backend schema. Treat a
+  non-zero status or `final_message=absent` as a failed delegation, even if a
+  partial log or an older output file exists.
 
 ## Safety and handoff
 

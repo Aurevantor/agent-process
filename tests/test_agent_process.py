@@ -191,6 +191,71 @@ class PromptInputTests(unittest.TestCase):
         self.assertIsNone(agent_process.prompt_from_inputs(["  "], stdin))
 
 
+class UsageLimitDetectionTests(unittest.TestCase):
+    def test_five_hour_limit_with_iso_reset_is_classified(self) -> None:
+        details = agent_process.detect_usage_limit(
+            "Error: 5-hour usage limit reached; resets at 2026-09-13T20:50:00+09:00\n"
+        )
+
+        self.assertEqual(
+            details,
+            agent_process.UsageLimitDetails(
+                limit="5h",
+                reset_at="2026-09-13T20:50:00+09:00",
+            ),
+        )
+
+    def test_weekly_limit_with_localized_numeric_reset_is_classified(self) -> None:
+        details = agent_process.detect_usage_limit(
+            "Weekly usage limit reached. Try again after 2026/09/20 15:50.\n"
+        )
+
+        self.assertEqual(
+            details,
+            agent_process.UsageLimitDetails(
+                limit="weekly",
+                reset_at="2026/09/20 15:50",
+            ),
+        )
+
+    def test_time_only_reset_is_preserved_as_a_hint_without_guessing_a_date(self) -> None:
+        details = agent_process.detect_usage_limit(
+            "Error: 5h limit reached; resets at 20:50.\n"
+        )
+
+        self.assertEqual(
+            details,
+            agent_process.UsageLimitDetails(limit="5h", reset_hint="20:50"),
+        )
+
+    def test_japanese_limit_labels_are_classified_without_guessing_a_date(self) -> None:
+        details = agent_process.detect_usage_limit(
+            "5時間の使用制限に達しました。リセット: 20:50\n"
+        )
+
+        self.assertEqual(
+            details,
+            agent_process.UsageLimitDetails(limit="5h", reset_hint="20:50"),
+        )
+
+    def test_json_error_fields_are_supported(self) -> None:
+        details = agent_process.detect_usage_limit(
+            '{"error":{"code":"usage_limit_reached","window":"weekly",'
+            '"reset_at":"2026-09-20T15:50:00+09:00"}}\n'
+        )
+
+        self.assertEqual(
+            details,
+            agent_process.UsageLimitDetails(
+                limit="weekly",
+                reset_at="2026-09-20T15:50:00+09:00",
+            ),
+        )
+
+    def test_unrelated_backend_text_is_not_classified(self) -> None:
+        self.assertIsNone(agent_process.detect_usage_limit("failed to parse config\n"))
+
+
 class ProcessExecutionTests(unittest.TestCase):
     @patch("agent_process.subprocess.Popen")
     def test_prompt_is_sent_on_stdin_and_child_status_is_returned(self, popen: unittest.mock.Mock) -> None:
@@ -204,6 +269,7 @@ class ProcessExecutionTests(unittest.TestCase):
         popen.assert_called_once_with(
             agent_process.build_command(config),
             stdin=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             cwd=None,
             env=unittest.mock.ANY,
@@ -231,11 +297,65 @@ class ProcessExecutionTests(unittest.TestCase):
 
         self.assertEqual(status, 7)
         self.assertIn("event=backend-exit", diagnostics.getvalue())
-        self.assertIn("version=0.2.0", diagnostics.getvalue())
+        self.assertIn("version=0.3.0", diagnostics.getvalue())
         self.assertIn("model=gpt-5.6-luna", diagnostics.getvalue())
         self.assertIn("timeout=4s", diagnostics.getvalue())
         self.assertIn("returncode=7", diagnostics.getvalue())
         self.assertNotIn("private prompt must not be logged", diagnostics.getvalue())
+
+    @patch("agent_process.subprocess.Popen")
+    def test_backend_stderr_is_relayed_and_usage_limit_is_structured(
+        self,
+        popen: unittest.mock.Mock,
+    ) -> None:
+        process = popen.return_value
+        process.returncode = 429
+        raw_error = (
+            "Error: weekly usage limit reached; reset at "
+            "2026-09-20T15:50:00+09:00\n"
+        )
+        process.communicate.return_value = (None, raw_error)
+        diagnostics = io.StringIO()
+
+        with redirect_stderr(diagnostics):
+            status = agent_process.run_process(
+                agent_process.RunConfig(model="gpt-5.3-codex-spark"),
+                "prompt",
+            )
+
+        output = diagnostics.getvalue()
+        self.assertEqual(status, 429)
+        self.assertIn(raw_error, output)
+        self.assertIn("event=usage-limit", output)
+        self.assertIn("limit=weekly", output)
+        self.assertIn("reset_at=2026-09-20T15:50:00+09:00", output)
+        self.assertIn("source=stderr", output)
+
+    @patch("agent_process.subprocess.Popen")
+    def test_time_only_usage_limit_diagnostic_does_not_invent_date(
+        self,
+        popen: unittest.mock.Mock,
+    ) -> None:
+        process = popen.return_value
+        process.returncode = 429
+        process.communicate.return_value = (
+            None,
+            "Error: 5-hour usage limit reached; resets at 20:50.\n",
+        )
+        diagnostics = io.StringIO()
+
+        with redirect_stderr(diagnostics):
+            status = agent_process.run_process(
+                agent_process.RunConfig(model="gpt-5.3-codex-spark"),
+                "prompt",
+            )
+
+        output = diagnostics.getvalue()
+        self.assertEqual(status, 429)
+        self.assertIn("event=usage-limit", output)
+        self.assertIn("limit=5h", output)
+        self.assertIn("reset_at=unknown", output)
+        self.assertIn("reset_hint=20:50", output)
 
     @patch("agent_process.subprocess.Popen", side_effect=FileNotFoundError)
     def test_missing_codex_returns_shell_style_not_found_status(self, _popen: unittest.mock.Mock) -> None:
@@ -280,7 +400,7 @@ class ProcessExecutionTests(unittest.TestCase):
         self.assertEqual(status, agent_process.EXIT_NESTED)
         popen.assert_not_called()
         self.assertIn("event=nested-rejected", diagnostics.getvalue())
-        self.assertIn("version=0.2.0", diagnostics.getvalue())
+        self.assertIn("version=0.3.0", diagnostics.getvalue())
         self.assertIn("model=gpt-5.3-codex-spark", diagnostics.getvalue())
         self.assertIn("timeout=3s", diagnostics.getvalue())
         self.assertNotIn("must not be consumed", diagnostics.getvalue())
@@ -359,7 +479,7 @@ class ProcessBoundaryIntegrationTests(unittest.TestCase):
         self.assertEqual(result.returncode, agent_process.EXIT_NESTED)
         self.assertEqual(backend_runs, ["backend"])
         self.assertIn("event=nested-rejected", result.stderr)
-        self.assertIn("version=0.2.0", result.stderr)
+        self.assertIn("version=0.3.0", result.stderr)
         self.assertNotIn("fixture prompt", result.stderr)
 
     def test_independent_top_level_runs_are_not_blocked(self) -> None:
@@ -416,6 +536,24 @@ class ProcessBoundaryIntegrationTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0)
         self.assertEqual(answer_text, "fresh answer\n")
+
+    def test_usage_limit_error_and_reset_are_returned_to_the_caller(self) -> None:
+        result = run_wrapper(
+            "--model",
+            "codex-spar",
+            "--codex-bin",
+            str(FAKE_CODEX),
+            "--timeout",
+            "1",
+            "-",
+            environment={"FAKE_CODEX_MODE": "usage-5h"},
+        )
+
+        self.assertEqual(result.returncode, 75)
+        self.assertIn("5-hour usage limit reached", result.stderr)
+        self.assertIn("event=usage-limit", result.stderr)
+        self.assertIn("limit=5h", result.stderr)
+        self.assertIn("reset_at=2026-09-13T20:50:00+09:00", result.stderr)
 
     def test_clearing_the_guard_is_a_negative_control_not_a_security_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

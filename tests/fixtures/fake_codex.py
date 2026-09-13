@@ -71,6 +71,24 @@ def run_sleep_with_grandchild() -> int:
     return 0
 
 
+def run_usage_limit(kind: str) -> int:
+    if kind == "5h":
+        print(
+            "Error: 5-hour usage limit reached; resets at "
+            "2026-09-13T20:50:00+09:00",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "Error: weekly usage limit reached; resets at "
+            "2026-09-20T15:50:00+09:00",
+            file=sys.stderr,
+        )
+    # Shell exit statuses are limited to 0..255; usage metadata carries the
+    # semantic error, while this fixture uses a stable non-zero backend code.
+    return int(os.environ.get("FAKE_CODEX_EXIT", "75"))
+
+
 def main() -> int:
     record_backend_run()
     mode = os.environ.get("FAKE_CODEX_MODE", "success")
@@ -80,6 +98,10 @@ def main() -> int:
         return run_recursive(clear_marker=True)
     if mode == "sleep-grandchild":
         return run_sleep_with_grandchild()
+    if mode == "usage-5h":
+        return run_usage_limit("5h")
+    if mode == "usage-weekly":
+        return run_usage_limit("weekly")
     if mode == "write-output":
         output = option_value("--output-last-message")
         if output is None:
