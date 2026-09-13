@@ -56,13 +56,22 @@ def run_recursive(clear_marker: bool) -> int:
 
 def run_sleep_with_grandchild() -> int:
     pid_file = os.environ["FAKE_CODEX_PID_FILE"]
+    parent_pid_file = os.environ.get("FAKE_CODEX_PARENT_PID_FILE")
+    if parent_pid_file is not None:
+        Path(parent_pid_file).write_text(str(os.getpid()), encoding="utf-8")
     child_code = (
         "import os, signal, time\n"
         f"from pathlib import Path\nPath({json.dumps(pid_file)}).write_text(str(os.getpid()), encoding='utf-8')\n"
         "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
         "time.sleep(30)\n"
     )
-    grandchild = subprocess.Popen([sys.executable, "-c", child_code])
+    # Keep the fixture's detached child from holding the wrapper's captured
+    # stderr pipe open when a negative-control mutation leaves it alive.
+    grandchild = subprocess.Popen(
+        [sys.executable, "-c", child_code],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
     try:
         time.sleep(30)
     finally:

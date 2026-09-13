@@ -116,10 +116,18 @@ conditions change.
 - The marker is an accidental-recursion guard, not a security sandbox. A
   child that deliberately removes or bypasses its environment can still start
   a wrapper; keep prompts bounded and use the access-mode boundary as well.
-- On POSIX, the backend starts in a new process group/session. A timeout sends
-  termination to that group only, escalates if needed, and exits with status
-  `124`; it must not terminate unrelated agent sessions. Other platforms use
-  the narrowest direct-process fallback available.
+- Every invocation has a finite wait deadline. The default is 300 seconds;
+  `--timeout SECONDS` can make it shorter or longer. On POSIX, the backend
+  starts in a new process group/session. A timeout sends termination to that
+  group only, escalates if needed, and exits with status `124`; it must not
+  terminate unrelated agent sessions. Other platforms use the narrowest
+  direct-process fallback available.
+- If the caller sends `SIGINT` (Ctrl-C), the wrapper terminates only its owned
+  backend group, drains output for a bounded grace period, reports
+  `event=interrupted cause=signal signal=SIGINT final_message=absent`, and
+  exits `130`. `SIGTERM` follows the same contract and exits `143`. A
+  cancellation never certifies a final-message artifact, even if a partial
+  file was created.
 - When `--output-last-message FILE` is supplied, status `0` is accepted as a
   successful final answer only when `FILE` is a regular file newly created or
   changed during this invocation. Missing or unchanged output returns `123`
@@ -133,13 +141,21 @@ conditions change.
   `limit` is `5h`, `weekly`, or `unknown`; a complete reset timestamp is
   copied to `reset_at`, while a time-only value is kept as `reset_hint` and
   `reset_at=unknown` so the wrapper never invents a date or timezone.
-- Timeout, nested rejection, and missing-artifact diagnostics are written to
-  stderr with `event`, wrapper `version`, resolved `model`, `sandbox`, and
-  `timeout` fields. Prompts and source contents are not copied into these
+- Timeout, interruption, nested rejection, and missing-artifact diagnostics
+  are written to stderr with `event`, wrapper `version`, per-run `run_id`,
+  resolved `model`, `sandbox`, `timeout`, and a stable termination cause when
+  applicable. Prompts and source contents are not copied into these
   diagnostics. Usage-limit detection is a compatibility parser for Codex
   error text/JSON, not a promise of an undocumented backend schema. Treat a
   non-zero status or `final_message=absent` as a failed delegation, even if a
   partial log or an older output file exists.
+- `agent-process` is the process/artifact boundary; it does not implement a
+  separate Spawned manager or wait API. A higher-level Spawned/wait caller
+  must propagate `123`/`124`/`125`/`130`/`143` and the corresponding
+  `event=output-missing`/`timeout`/`nested-rejected`/`interrupted` diagnostic
+  as an incomplete or failed state, never as a successful result. It must
+  also keep the `run_id` when correlating that state and must not fall back to
+  a stale final-message file.
 
 ## Safety and handoff
 

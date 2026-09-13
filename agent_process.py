@@ -17,21 +17,33 @@ import signal
 import stat
 import subprocess
 import sys
+import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TextIO
 
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 DEFAULT_MODEL = "codex-spar"
 DEFAULT_CODEX_BIN = "codex"
 DEFAULT_SANDBOX = "read-only"
+DEFAULT_TIMEOUT_SECONDS = 300.0
 EXIT_OUTPUT_MISSING = 123
 EXIT_TIMEOUT = 124
 EXIT_NESTED = 125
+EXIT_INTERRUPTED = 130
+EXIT_TERMINATED = 143
 NESTING_ENV = "AGENT_PROCESS_NESTING"
 NESTING_MARKER = "1"
 PROCESS_GROUP_GRACE_SECONDS = 0.25
+
+
+class _ProcessInterrupted(Exception):
+    """Internal signal used to unwind into bounded child-process cleanup."""
+
+    def __init__(self, signum: int) -> None:
+        self.signum = signum
+        super().__init__(signum)
 
 
 @dataclass(frozen=True)
@@ -201,7 +213,10 @@ class RunConfig:
     add_dirs: tuple[str, ...] = field(default_factory=tuple)
     profile: str | None = None
     config_overrides: tuple[str, ...] = field(default_factory=tuple)
-    timeout: float | None = None
+    # ``None`` is retained for direct callers from older versions, but
+    # run_process() normalizes it to the finite default before spawning.
+    timeout: float | None = DEFAULT_TIMEOUT_SECONDS
+    run_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
 
 def _coerce_text(value: object) -> str:
@@ -392,7 +407,8 @@ def create_parser() -> argparse.ArgumentParser:
         epilog=(
             "MODEL may be codex-spar, luna-max, or any raw Codex model name. "
             "With no PROMPT, or with PROMPT '-', stdin is used. "
-            "Nested runs exit 125; timeouts exit 124; missing requested output exits 123. "
+            "The default timeout is 300 seconds. Nested runs exit 125; timeouts exit 124; "
+            "SIGINT exits 130; SIGTERM exits 143; missing requested output exits 123. "
             "Recognized backend usage limits are described on stderr with event=usage-limit."
         ),
     )
@@ -471,7 +487,8 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--timeout",
         type=_positive_timeout,
-        help="stop waiting after this many seconds",
+        default=DEFAULT_TIMEOUT_SECONDS,
+        help=f"stop waiting after this many seconds (default: {DEFAULT_TIMEOUT_SECONDS:g})",
     )
     parser.add_argument(
         "--list-models",
@@ -552,6 +569,12 @@ def _timeout_label(timeout: float | None) -> str:
     return "none" if timeout is None else f"{timeout:g}s"
 
 
+def _effective_timeout(timeout: float | None) -> float:
+    """Return the finite timeout used for every backend wait."""
+
+    return DEFAULT_TIMEOUT_SECONDS if timeout is None else timeout
+
+
 def _diagnostic_value(value: str) -> str:
     sanitized = value.replace("\r", r"\r").replace("\n", r"\n")
     return shlex.quote(sanitized)
@@ -570,9 +593,10 @@ def _emit_diagnostic(
     fields = (
         f"event={event}",
         f"version={VERSION}",
+        f"run_id={config.run_id}",
         f"model={config.model}",
         f"sandbox={config.sandbox}",
-        f"timeout={_timeout_label(config.timeout)}",
+        f"timeout={_timeout_label(_effective_timeout(config.timeout))}",
     )
     if final_message is not None:
         fields += (f"final_message={final_message}",)
@@ -597,6 +621,73 @@ def _child_environment() -> dict[str, str]:
     environment = os.environ.copy()
     environment[NESTING_ENV] = NESTING_MARKER
     return environment
+
+
+def _interrupt_signals() -> tuple[int, ...]:
+    return tuple(
+        int(signum)
+        for signum in (
+            getattr(signal, "SIGINT", None),
+            getattr(signal, "SIGTERM", None),
+        )
+        if signum is not None
+    )
+
+
+def _raise_process_signal(signum: int, _frame: object) -> None:
+    raise _ProcessInterrupted(signum)
+
+
+def _install_signal_handlers() -> dict[int, object]:
+    """Install handlers that turn caller cancellation into a clean unwind."""
+
+    previous: dict[int, object] = {}
+    for signum in _interrupt_signals():
+        try:
+            previous[signum] = signal.signal(signum, _raise_process_signal)
+        except (OSError, RuntimeError, ValueError):
+            # Signal handlers are only available from the main interpreter
+            # thread.  The direct API remains usable elsewhere; the CLI uses
+            # the main thread and gets the full cancellation contract.
+            continue
+    return previous
+
+
+def _set_signal_handlers(signals_to_update: Mapping[int, object], handler: object) -> None:
+    for signum in signals_to_update:
+        try:
+            signal.signal(signum, handler)  # type: ignore[arg-type]
+        except (OSError, RuntimeError, ValueError):
+            continue
+
+
+def _restore_signal_handlers(previous: Mapping[int, object]) -> None:
+    for signum, handler in previous.items():
+        try:
+            signal.signal(signum, handler)  # type: ignore[arg-type]
+        except (OSError, RuntimeError, ValueError):
+            continue
+
+
+def _suppress_signal_handlers(previous: Mapping[int, object]) -> None:
+    """Prevent a second interrupt from breaking bounded cleanup."""
+
+    _set_signal_handlers(previous, signal.SIG_IGN)
+
+
+def _signal_name(signum: int) -> str:
+    try:
+        return signal.Signals(signum).name
+    except ValueError:
+        return f"signal-{signum}"
+
+
+def _signal_exit_status(signum: int) -> int:
+    if signum == int(signal.SIGINT):
+        return EXIT_INTERRUPTED
+    if signum == int(signal.SIGTERM):
+        return EXIT_TERMINATED
+    return 128 + signum
 
 
 def _popen_options(config: RunConfig) -> dict[str, object]:
@@ -710,6 +801,19 @@ def _stderr_from_communicate(result: object) -> str:
     return _coerce_text(result[1])
 
 
+def _drain_process_after_termination(
+    process: subprocess.Popen[str],
+    stderr_text: str = "",
+) -> str:
+    """Collect only already-finished child output after bounded cleanup."""
+
+    try:
+        communication = process.communicate(timeout=PROCESS_GROUP_GRACE_SECONDS)
+    except (BrokenPipeError, OSError, ValueError, subprocess.TimeoutExpired):
+        return stderr_text
+    return _stderr_from_communicate(communication) or stderr_text
+
+
 def _relay_backend_stderr(stderr_text: str) -> None:
     """Preserve the backend error for the caller without putting it in stdout."""
 
@@ -783,6 +887,37 @@ def _normal_exit_status(
     return EXIT_OUTPUT_MISSING
 
 
+def _handle_process_interruption(
+    config: RunConfig,
+    process: subprocess.Popen[str] | None,
+    interruption: _ProcessInterrupted,
+) -> int:
+    """Clean up the owned backend group and report a typed cancellation."""
+
+    if process is not None:
+        stderr_text = ""
+        # Do not allow a second SIGINT/SIGTERM to interrupt the bounded
+        # terminate/drain sequence and leave descendants behind.
+        _terminate_process(process)
+        stderr_text = _drain_process_after_termination(process, stderr_text)
+        _relay_backend_stderr(stderr_text)
+        _close_process_stdin(process)
+        _close_process_stderr(process)
+
+    status = _signal_exit_status(interruption.signum)
+    _emit_diagnostic(
+        config,
+        "interrupted",
+        final_message="absent",
+        returncode=status,
+        details={
+            "cause": "signal",
+            "signal": _signal_name(interruption.signum),
+        },
+    )
+    return status
+
+
 def run_process(config: RunConfig, prompt: str) -> int:
     """Run Codex in an owned process group and return a stable shell status."""
 
@@ -790,48 +925,67 @@ def run_process(config: RunConfig, prompt: str) -> int:
         _emit_diagnostic(config, "nested-rejected", final_message="absent")
         return EXIT_NESTED
 
-    output_before = _output_snapshot(config.output_last_message)
+    previous_handlers = _install_signal_handlers()
+    process: subprocess.Popen[str] | None = None
     try:
-        process = subprocess.Popen(build_command(config), **_popen_options(config))
-    except FileNotFoundError:
-        print(f"agent-process: Codex executable not found: {config.codex_bin}", file=sys.stderr)
-        return 127
-    except PermissionError:
-        print(f"agent-process: Codex executable is not runnable: {config.codex_bin}", file=sys.stderr)
-        return 126
-    except OSError as error:
-        print(f"agent-process: could not start Codex: {error}", file=sys.stderr)
-        return 126
-
-    try:
-        communication = process.communicate(input=prompt, timeout=config.timeout)
-        stderr_text = _stderr_from_communicate(communication)
-    except subprocess.TimeoutExpired as error:
-        stderr_text = _coerce_text(getattr(error, "stderr", None))
-        _terminate_process(process)
-        # Drain only for a bounded grace period.  A detached descendant must
-        # never make a timeout wait forever just because it inherited stderr.
+        output_before = _output_snapshot(config.output_last_message)
         try:
-            communication = process.communicate(timeout=PROCESS_GROUP_GRACE_SECONDS)
-        except (BrokenPipeError, OSError, ValueError, subprocess.TimeoutExpired):
-            pass
-        else:
-            stderr_text = _stderr_from_communicate(communication) or stderr_text
-        _relay_backend_stderr(stderr_text)
-        _close_process_stdin(process)
-        _close_process_stderr(process)
-        _emit_diagnostic(config, "timeout", final_message="absent")
-        return EXIT_TIMEOUT
+            process = subprocess.Popen(build_command(config), **_popen_options(config))
+        except FileNotFoundError:
+            print(f"agent-process: Codex executable not found: {config.codex_bin}", file=sys.stderr)
+            return 127
+        except PermissionError:
+            print(f"agent-process: Codex executable is not runnable: {config.codex_bin}", file=sys.stderr)
+            return 126
+        except OSError as error:
+            print(f"agent-process: could not start Codex: {error}", file=sys.stderr)
+            return 126
 
-    _relay_backend_stderr(stderr_text)
-    returncode = process.returncode
-    if returncode is None:
-        # Popen.communicate() normally waits, but keep mocked/custom Popen
-        # implementations from making the wrapper report a false success.
-        returncode = process.wait()
-    if returncode < 0:
-        returncode = 128 + (-returncode)
-    return _normal_exit_status(config, returncode, output_before, stderr_text)
+        try:
+            communication = process.communicate(
+                input=prompt,
+                timeout=_effective_timeout(config.timeout),
+            )
+            stderr_text = _stderr_from_communicate(communication)
+        except subprocess.TimeoutExpired as error:
+            stderr_text = _coerce_text(getattr(error, "stderr", None))
+            _suppress_signal_handlers(previous_handlers)
+            _terminate_process(process)
+            # Drain only for a bounded grace period.  A detached descendant must
+            # never make a timeout wait forever just because it inherited stderr.
+            stderr_text = _drain_process_after_termination(process, stderr_text)
+            _relay_backend_stderr(stderr_text)
+            _close_process_stdin(process)
+            _close_process_stderr(process)
+            _emit_diagnostic(
+                config,
+                "timeout",
+                final_message="absent",
+                details={"cause": "timeout"},
+            )
+            return EXIT_TIMEOUT
+
+        _relay_backend_stderr(stderr_text)
+        returncode = process.returncode
+        if returncode is None:
+            # Popen.communicate() normally waits, but keep mocked/custom Popen
+            # implementations from making the wrapper report a false success.
+            returncode = process.wait()
+        if returncode < 0:
+            returncode = 128 + (-returncode)
+        return _normal_exit_status(config, returncode, output_before, stderr_text)
+    except _ProcessInterrupted as interruption:
+        _suppress_signal_handlers(previous_handlers)
+        return _handle_process_interruption(config, process, interruption)
+    except KeyboardInterrupt:
+        # A caller can deliver Ctrl-C in the small interval before Python has
+        # installed the custom handler, or a direct caller can raise it.  Keep
+        # the same typed cancellation contract in either case.
+        interruption = _ProcessInterrupted(int(signal.SIGINT))
+        _suppress_signal_handlers(previous_handlers)
+        return _handle_process_interruption(config, process, interruption)
+    finally:
+        _restore_signal_handlers(previous_handlers)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

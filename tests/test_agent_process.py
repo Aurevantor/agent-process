@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -62,6 +63,30 @@ def wait_for_process_exit(process_id: int, timeout: float = 2.0) -> bool:
             return True
         time.sleep(0.01)
     return not process_is_alive(process_id)
+
+
+def read_available_pipe(stream: object, timeout: float = 0.5) -> str:
+    """Read a pipe without waiting forever for a mutated child to close it."""
+
+    if stream is None or not hasattr(stream, "fileno"):
+        return ""
+    file_descriptor = stream.fileno()
+    os.set_blocking(file_descriptor, False)
+    chunks: list[bytes] = []
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        remaining = max(0.0, deadline - time.monotonic())
+        readable, _, _ = select.select([file_descriptor], [], [], remaining)
+        if not readable:
+            break
+        try:
+            chunk = os.read(file_descriptor, 65536)
+        except BlockingIOError:
+            continue
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks).decode("utf-8", errors="replace")
 
 
 class ModelResolutionTests(unittest.TestCase):
@@ -157,6 +182,13 @@ class CommandConstructionTests(unittest.TestCase):
         self.assertEqual(default_config.sandbox, "read-only")
         self.assertEqual(write_config.sandbox, "workspace-write")
         self.assertEqual(shorthand_config.sandbox, "workspace-write")
+
+    def test_timeout_defaults_to_a_finite_value(self) -> None:
+        namespace = agent_process.create_parser().parse_args([])
+        config = agent_process.config_from_args(namespace, environ={})
+
+        self.assertEqual(config.timeout, 300.0)
+        self.assertGreater(config.timeout, 0)
 
 
 class PromptInputTests(unittest.TestCase):
@@ -276,7 +308,10 @@ class ProcessExecutionTests(unittest.TestCase):
             **({"start_new_session": True} if os.name == "posix" else {}),
         )
         self.assertEqual(popen.call_args.kwargs["env"][agent_process.NESTING_ENV], "1")
-        process.communicate.assert_called_once_with(input="line one\nline two", timeout=None)
+        process.communicate.assert_called_once_with(
+            input="line one\nline two",
+            timeout=300.0,
+        )
 
     @patch("agent_process.subprocess.Popen")
     def test_nonzero_backend_status_has_bounded_diagnostic_metadata(
@@ -297,10 +332,11 @@ class ProcessExecutionTests(unittest.TestCase):
 
         self.assertEqual(status, 7)
         self.assertIn("event=backend-exit", diagnostics.getvalue())
-        self.assertIn("version=0.3.0", diagnostics.getvalue())
+        self.assertIn(f"version={agent_process.VERSION}", diagnostics.getvalue())
         self.assertIn("model=gpt-5.6-luna", diagnostics.getvalue())
         self.assertIn("timeout=4s", diagnostics.getvalue())
         self.assertIn("returncode=7", diagnostics.getvalue())
+        self.assertRegex(diagnostics.getvalue(), r"run_id=[0-9a-f]{32}")
         self.assertNotIn("private prompt must not be logged", diagnostics.getvalue())
 
     @patch("agent_process.subprocess.Popen")
@@ -400,7 +436,7 @@ class ProcessExecutionTests(unittest.TestCase):
         self.assertEqual(status, agent_process.EXIT_NESTED)
         popen.assert_not_called()
         self.assertIn("event=nested-rejected", diagnostics.getvalue())
-        self.assertIn("version=0.3.0", diagnostics.getvalue())
+        self.assertIn(f"version={agent_process.VERSION}", diagnostics.getvalue())
         self.assertIn("model=gpt-5.3-codex-spark", diagnostics.getvalue())
         self.assertIn("timeout=3s", diagnostics.getvalue())
         self.assertNotIn("must not be consumed", diagnostics.getvalue())
@@ -479,7 +515,7 @@ class ProcessBoundaryIntegrationTests(unittest.TestCase):
         self.assertEqual(result.returncode, agent_process.EXIT_NESTED)
         self.assertEqual(backend_runs, ["backend"])
         self.assertIn("event=nested-rejected", result.stderr)
-        self.assertIn("version=0.3.0", result.stderr)
+        self.assertIn(f"version={agent_process.VERSION}", result.stderr)
         self.assertNotIn("fixture prompt", result.stderr)
 
     def test_independent_top_level_runs_are_not_blocked(self) -> None:
@@ -615,6 +651,101 @@ class ProcessBoundaryIntegrationTests(unittest.TestCase):
                 if sibling.poll() is None:
                     sibling.terminate()
                 sibling.wait(timeout=2)
+
+    @unittest.skipUnless(os.name == "posix", "process-group semantics are POSIX-specific")
+    def test_sigint_and_sigterm_return_typed_status_and_clean_owned_group(self) -> None:
+        for signum, expected_status, signal_name in (
+            (signal.SIGINT, agent_process.EXIT_INTERRUPTED, "SIGINT"),
+            (signal.SIGTERM, agent_process.EXIT_TERMINATED, "SIGTERM"),
+        ):
+            with self.subTest(signal=signal_name), tempfile.TemporaryDirectory() as directory:
+                directory_path = Path(directory)
+                grandchild_pid_file = directory_path / "grandchild.pid"
+                answer = directory_path / "answer.txt"
+                answer.write_text("old answer\n", encoding="utf-8")
+                backend_pid_file = directory_path / "backend.pid"
+                sibling = subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(30)"],
+                    start_new_session=True,
+                )
+                wrapper_environment = os.environ.copy()
+                wrapper_environment.pop(agent_process.NESTING_ENV, None)
+                wrapper_environment.update(
+                    {
+                        "FAKE_CODEX_MODE": "sleep-grandchild",
+                        "FAKE_CODEX_PID_FILE": str(grandchild_pid_file),
+                        "FAKE_CODEX_PARENT_PID_FILE": str(backend_pid_file),
+                    }
+                )
+                wrapper = subprocess.Popen(
+                    [
+                        str(WRAPPER),
+                        "--model",
+                        "codex-spar",
+                        "--codex-bin",
+                        str(FAKE_CODEX),
+                        "--output-last-message",
+                        str(answer),
+                        "-",
+                    ],
+                    cwd=ROOT,
+                    env=wrapper_environment,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    start_new_session=True,
+                )
+                grandchild_pid: int | None = None
+                backend_pid: int | None = None
+                try:
+                    assert wrapper.stdin is not None
+                    wrapper.stdin.write("fixture prompt\n")
+                    wrapper.stdin.close()
+                    wait_for_file(grandchild_pid_file)
+                    grandchild_pid = int(grandchild_pid_file.read_text(encoding="utf-8"))
+                    wait_for_file(backend_pid_file)
+                    backend_pid = int(backend_pid_file.read_text(encoding="utf-8"))
+
+                    os.kill(wrapper.pid, signum)
+                    wrapper.wait(timeout=3)
+                    stdout = read_available_pipe(wrapper.stdout)
+                    stderr = read_available_pipe(wrapper.stderr)
+                    if wrapper.stdout is not None:
+                        wrapper.stdout.close()
+                    if wrapper.stderr is not None:
+                        wrapper.stderr.close()
+
+                    self.assertEqual(wrapper.returncode, expected_status)
+                    self.assertEqual(stdout, "")
+                    self.assertIn("event=interrupted", stderr)
+                    self.assertIn("cause=signal", stderr)
+                    self.assertIn(f"signal={signal_name}", stderr)
+                    self.assertIn("final_message=absent", stderr)
+                    self.assertIn(f"returncode={expected_status}", stderr)
+                    self.assertRegex(stderr, r"run_id=[0-9a-f]{32}")
+                    self.assertNotIn("fixture prompt", stderr)
+                    self.assertEqual(answer.read_text(encoding="utf-8"), "old answer\n")
+                    self.assertTrue(wait_for_process_exit(grandchild_pid))
+                    self.assertIsNone(sibling.poll())
+                finally:
+                    if grandchild_pid is None and grandchild_pid_file.exists():
+                        grandchild_pid = int(grandchild_pid_file.read_text(encoding="utf-8"))
+                    if backend_pid is None and backend_pid_file.exists():
+                        backend_pid = int(backend_pid_file.read_text(encoding="utf-8"))
+                    if wrapper.poll() is None:
+                        wrapper.kill()
+                    wrapper.wait(timeout=2)
+                    for stream in (wrapper.stdin, wrapper.stdout, wrapper.stderr):
+                        if stream is not None:
+                            stream.close()
+                    if backend_pid is not None and process_is_alive(backend_pid):
+                        os.kill(backend_pid, signal.SIGKILL)
+                    if grandchild_pid is not None and process_is_alive(grandchild_pid):
+                        os.kill(grandchild_pid, signal.SIGKILL)
+                    if sibling.poll() is None:
+                        sibling.terminate()
+                    sibling.wait(timeout=2)
 
 
 class MainTests(unittest.TestCase):
