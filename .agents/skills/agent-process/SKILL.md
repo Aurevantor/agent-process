@@ -107,6 +107,30 @@ conditions change.
   approved retry again, report the remaining blocker and ask for direction;
   do not loop through retries or repeated identical approval requests.
 
+## Process and artifact contract
+
+- Every backend process receives `AGENT_PROCESS_NESTING=1`. A wrapper started
+  from that backend rejects the nested run before reading its prompt or
+  launching another Codex backend, and exits with status `125`. A separately
+  started top-level wrapper has no marker and remains allowed.
+- The marker is an accidental-recursion guard, not a security sandbox. A
+  child that deliberately removes or bypasses its environment can still start
+  a wrapper; keep prompts bounded and use the access-mode boundary as well.
+- On POSIX, the backend starts in a new process group/session. A timeout sends
+  termination to that group only, escalates if needed, and exits with status
+  `124`; it must not terminate unrelated agent sessions. Other platforms use
+  the narrowest direct-process fallback available.
+- When `--output-last-message FILE` is supplied, status `0` is accepted as a
+  successful final answer only when `FILE` is a regular file newly created or
+  changed during this invocation. Missing or unchanged output returns `123`
+  with `final_message=absent`; an old file must not be reused. Timeout and
+  nested rejection likewise never certify an output file.
+- Timeout, nested rejection, and missing-artifact diagnostics are written to
+  stderr with `event`, wrapper `version`, resolved `model`, `sandbox`, and
+  `timeout` fields. Prompts and source contents are not copied into these
+  diagnostics. Treat a non-zero status or `final_message=absent` as a failed
+  delegation, even if a partial log or an older output file exists.
+
 ## Safety and handoff
 
 - The wrapper defaults to `--mode read-only` and `--ephemeral`.

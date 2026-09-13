@@ -29,7 +29,7 @@ jobs:
         run: python3 -m unittest discover -s tests -v
 
       - name: Compile Python modules
-        run: python3 -m py_compile agent_process.py tests/test_agent_process.py
+        run: python3 -m py_compile agent_process.py tests/test_agent_process.py tests/fixtures/fake_codex.py tests/test_install_local.py
 
       - name: Run CLI smoke test
         shell: bash

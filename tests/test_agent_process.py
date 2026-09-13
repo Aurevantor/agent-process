@@ -2,11 +2,66 @@ from __future__ import annotations
 
 import io
 import os
+import signal
 import subprocess
+import sys
+import tempfile
+import time
 import unittest
+from contextlib import redirect_stderr
+from pathlib import Path
 from unittest.mock import patch
 
 import agent_process
+
+
+ROOT = Path(__file__).resolve().parents[1]
+FAKE_CODEX = ROOT / "tests" / "fixtures" / "fake_codex.py"
+WRAPPER = ROOT / "agent-process"
+
+
+def run_wrapper(*arguments: str, environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env.pop(agent_process.NESTING_ENV, None)
+    env.update(environment)
+    return subprocess.run(
+        [str(WRAPPER), *arguments],
+        cwd=ROOT,
+        env=env,
+        input="fixture prompt\n",
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+
+
+def wait_for_file(path: Path, timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"fixture did not create {path}")
+
+
+def process_is_alive(process_id: int) -> bool:
+    try:
+        os.kill(process_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def wait_for_process_exit(process_id: int, timeout: float = 2.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not process_is_alive(process_id):
+            return True
+        time.sleep(0.01)
+    return not process_is_alive(process_id)
 
 
 class ModelResolutionTests(unittest.TestCase):
@@ -137,25 +192,53 @@ class PromptInputTests(unittest.TestCase):
 
 
 class ProcessExecutionTests(unittest.TestCase):
-    @patch("agent_process.subprocess.run")
-    def test_prompt_is_sent_on_stdin_and_child_status_is_returned(self, run: unittest.mock.Mock) -> None:
-        run.return_value = subprocess.CompletedProcess(args=["codex"], returncode=7)
+    @patch("agent_process.subprocess.Popen")
+    def test_prompt_is_sent_on_stdin_and_child_status_is_returned(self, popen: unittest.mock.Mock) -> None:
+        process = popen.return_value
+        process.returncode = 7
         config = agent_process.RunConfig(model="gpt-5.3-codex-spark")
 
         status = agent_process.run_process(config, "line one\nline two")
 
         self.assertEqual(status, 7)
-        run.assert_called_once_with(
+        popen.assert_called_once_with(
             agent_process.build_command(config),
-            input="line one\nline two",
+            stdin=subprocess.PIPE,
             text=True,
             cwd=None,
-            check=False,
-            timeout=None,
+            env=unittest.mock.ANY,
+            **({"start_new_session": True} if os.name == "posix" else {}),
         )
+        self.assertEqual(popen.call_args.kwargs["env"][agent_process.NESTING_ENV], "1")
+        process.communicate.assert_called_once_with(input="line one\nline two", timeout=None)
 
-    @patch("agent_process.subprocess.run", side_effect=FileNotFoundError)
-    def test_missing_codex_returns_shell_style_not_found_status(self, _run: unittest.mock.Mock) -> None:
+    @patch("agent_process.subprocess.Popen")
+    def test_nonzero_backend_status_has_bounded_diagnostic_metadata(
+        self,
+        popen: unittest.mock.Mock,
+    ) -> None:
+        popen.return_value.returncode = 7
+        diagnostics = io.StringIO()
+
+        with redirect_stderr(diagnostics):
+            status = agent_process.run_process(
+                agent_process.RunConfig(
+                    model="gpt-5.6-luna",
+                    timeout=4,
+                ),
+                "private prompt must not be logged",
+            )
+
+        self.assertEqual(status, 7)
+        self.assertIn("event=backend-exit", diagnostics.getvalue())
+        self.assertIn("version=0.2.0", diagnostics.getvalue())
+        self.assertIn("model=gpt-5.6-luna", diagnostics.getvalue())
+        self.assertIn("timeout=4s", diagnostics.getvalue())
+        self.assertIn("returncode=7", diagnostics.getvalue())
+        self.assertNotIn("private prompt must not be logged", diagnostics.getvalue())
+
+    @patch("agent_process.subprocess.Popen", side_effect=FileNotFoundError)
+    def test_missing_codex_returns_shell_style_not_found_status(self, _popen: unittest.mock.Mock) -> None:
         status = agent_process.run_process(
             agent_process.RunConfig(model="gpt-5.3-codex-spark", codex_bin="missing-codex"),
             "prompt",
@@ -164,19 +247,256 @@ class ProcessExecutionTests(unittest.TestCase):
         self.assertEqual(status, 127)
 
     @patch(
-        "agent_process.subprocess.run",
-        side_effect=subprocess.TimeoutExpired(cmd=["codex"], timeout=1),
+        "agent_process.subprocess.Popen",
     )
-    def test_timeout_returns_status_124(self, _run: unittest.mock.Mock) -> None:
+    @patch("agent_process._terminate_process")
+    def test_timeout_returns_status_124(
+        self,
+        terminate_process: unittest.mock.Mock,
+        popen: unittest.mock.Mock,
+    ) -> None:
+        popen.return_value.communicate.side_effect = subprocess.TimeoutExpired(cmd=["codex"], timeout=1)
         status = agent_process.run_process(
             agent_process.RunConfig(model="gpt-5.3-codex-spark", timeout=1),
             "prompt",
         )
 
         self.assertEqual(status, 124)
+        terminate_process.assert_called_once_with(popen.return_value)
+
+    @patch("agent_process.subprocess.Popen")
+    def test_nested_invocation_is_rejected_before_backend_start(
+        self,
+        popen: unittest.mock.Mock,
+    ) -> None:
+        config = agent_process.RunConfig(model="gpt-5.3-codex-spark", timeout=3)
+        diagnostics = io.StringIO()
+
+        with patch.dict(os.environ, {agent_process.NESTING_ENV: agent_process.NESTING_MARKER}), redirect_stderr(
+            diagnostics
+        ):
+            status = agent_process.run_process(config, "must not be consumed")
+
+        self.assertEqual(status, agent_process.EXIT_NESTED)
+        popen.assert_not_called()
+        self.assertIn("event=nested-rejected", diagnostics.getvalue())
+        self.assertIn("version=0.2.0", diagnostics.getvalue())
+        self.assertIn("model=gpt-5.3-codex-spark", diagnostics.getvalue())
+        self.assertIn("timeout=3s", diagnostics.getvalue())
+        self.assertNotIn("must not be consumed", diagnostics.getvalue())
+
+    @patch("agent_process.subprocess.Popen")
+    def test_new_output_file_is_required_for_a_zero_exit_with_output_option(
+        self,
+        popen: unittest.mock.Mock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "answer.txt"
+            process = popen.return_value
+            process.returncode = 0
+
+            def write_answer(**_kwargs: object) -> None:
+                output.write_text("fresh answer\n", encoding="utf-8")
+
+            process.communicate.side_effect = write_answer
+            status = agent_process.run_process(
+                agent_process.RunConfig(
+                    model="gpt-5.3-codex-spark",
+                    output_last_message=str(output),
+                ),
+                "prompt",
+            )
+
+        self.assertEqual(status, 0)
+
+    @patch("agent_process.subprocess.Popen")
+    def test_stale_output_file_is_not_accepted_as_the_current_answer(
+        self,
+        popen: unittest.mock.Mock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "answer.txt"
+            output.write_text("old answer\n", encoding="utf-8")
+            process = popen.return_value
+            process.returncode = 0
+            diagnostics = io.StringIO()
+
+            with redirect_stderr(diagnostics):
+                status = agent_process.run_process(
+                    agent_process.RunConfig(
+                        model="gpt-5.3-codex-spark",
+                        output_last_message=str(output),
+                    ),
+                    "prompt",
+                )
+
+        self.assertEqual(status, agent_process.EXIT_OUTPUT_MISSING)
+        self.assertIn("event=output-missing", diagnostics.getvalue())
+        self.assertIn("final_message=absent", diagnostics.getvalue())
+
+
+class ProcessBoundaryIntegrationTests(unittest.TestCase):
+    def test_recursive_fixture_is_rejected_without_a_second_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            backend_count = Path(directory) / "backend-count.txt"
+            result = run_wrapper(
+                "--model",
+                "codex-spar",
+                "--codex-bin",
+                str(FAKE_CODEX),
+                "--timeout",
+                "1",
+                "-",
+                environment={
+                    "FAKE_CODEX_MODE": "recursive",
+                    "FAKE_CODEX_COUNT_FILE": str(backend_count),
+                    "FAKE_AGENT_PROCESS": str(WRAPPER),
+                },
+            )
+
+            backend_runs = backend_count.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(result.returncode, agent_process.EXIT_NESTED)
+        self.assertEqual(backend_runs, ["backend"])
+        self.assertIn("event=nested-rejected", result.stderr)
+        self.assertIn("version=0.2.0", result.stderr)
+        self.assertNotIn("fixture prompt", result.stderr)
+
+    def test_independent_top_level_runs_are_not_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            backend_count = Path(directory) / "backend-count.txt"
+            environment = {
+                "FAKE_CODEX_MODE": "success",
+                "FAKE_CODEX_COUNT_FILE": str(backend_count),
+            }
+            first = run_wrapper(
+                "--model",
+                "codex-spar",
+                "--codex-bin",
+                str(FAKE_CODEX),
+                "--timeout",
+                "1",
+                "-",
+                environment=environment,
+            )
+            second = run_wrapper(
+                "--model",
+                "codex-spar",
+                "--codex-bin",
+                str(FAKE_CODEX),
+                "--timeout",
+                "1",
+                "-",
+                environment=environment,
+            )
+
+            backend_runs = backend_count.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(first.returncode, 0)
+        self.assertEqual(second.returncode, 0)
+        self.assertEqual(backend_runs, ["backend", "backend"])
+
+    def test_fresh_fake_final_answer_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            answer = Path(directory) / "answer.txt"
+            result = run_wrapper(
+                "--model",
+                "codex-spar",
+                "--codex-bin",
+                str(FAKE_CODEX),
+                "--output-last-message",
+                str(answer),
+                "--timeout",
+                "1",
+                "-",
+                environment={"FAKE_CODEX_MODE": "write-output"},
+            )
+
+            answer_text = answer.read_text(encoding="utf-8")
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(answer_text, "fresh answer\n")
+
+    def test_clearing_the_guard_is_a_negative_control_not_a_security_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            backend_count = Path(directory) / "backend-count.txt"
+            result = run_wrapper(
+                "--model",
+                "codex-spar",
+                "--codex-bin",
+                str(FAKE_CODEX),
+                "--timeout",
+                "1",
+                "-",
+                environment={
+                    "FAKE_CODEX_MODE": "recursive-clear-marker",
+                    "FAKE_CODEX_COUNT_FILE": str(backend_count),
+                    "FAKE_AGENT_PROCESS": str(WRAPPER),
+                },
+            )
+
+            backend_runs = backend_count.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(backend_runs, ["backend", "backend"])
+
+    @unittest.skipUnless(os.name == "posix", "process-group semantics are POSIX-specific")
+    def test_timeout_terminates_grandchild_but_not_an_external_sibling(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            grandchild_pid_file = Path(directory) / "grandchild.pid"
+            sibling = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                start_new_session=True,
+            )
+            grandchild_pid: int | None = None
+            try:
+                result = run_wrapper(
+                    "--model",
+                    "codex-spar",
+                    "--codex-bin",
+                    str(FAKE_CODEX),
+                    "--timeout",
+                    "0.2",
+                    "-",
+                    environment={
+                        "FAKE_CODEX_MODE": "sleep-grandchild",
+                        "FAKE_CODEX_PID_FILE": str(grandchild_pid_file),
+                    },
+                )
+                wait_for_file(grandchild_pid_file)
+                grandchild_pid = int(grandchild_pid_file.read_text(encoding="utf-8"))
+
+                self.assertEqual(result.returncode, agent_process.EXIT_TIMEOUT)
+                self.assertTrue(wait_for_process_exit(grandchild_pid))
+                self.assertIsNone(sibling.poll())
+            finally:
+                if grandchild_pid is None and grandchild_pid_file.exists():
+                    grandchild_pid = int(grandchild_pid_file.read_text(encoding="utf-8"))
+                if grandchild_pid is not None and process_is_alive(grandchild_pid):
+                    os.kill(grandchild_pid, signal.SIGKILL)
+                if sibling.poll() is None:
+                    sibling.terminate()
+                sibling.wait(timeout=2)
 
 
 class MainTests(unittest.TestCase):
+    @patch("agent_process.run_process")
+    def test_main_rejects_nested_before_running_or_consuming_prompt(
+        self,
+        run: unittest.mock.Mock,
+    ) -> None:
+        diagnostics = io.StringIO()
+
+        with patch.dict(
+            os.environ,
+            {agent_process.NESTING_ENV: agent_process.NESTING_MARKER},
+        ), redirect_stderr(diagnostics):
+            status = agent_process.main(["--model", "codex-spar", "sensitive prompt"])
+
+        self.assertEqual(status, agent_process.EXIT_NESTED)
+        run.assert_not_called()
+        self.assertNotIn("sensitive prompt", diagnostics.getvalue())
+
     def test_main_uses_environment_defaults(self) -> None:
         stdin = io.StringIO("prompt from stdin")
         stdin.isatty = lambda: False  # type: ignore[method-assign]

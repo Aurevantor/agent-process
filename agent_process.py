@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
+import stat
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
@@ -17,10 +19,16 @@ from dataclasses import dataclass, field
 from typing import TextIO
 
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 DEFAULT_MODEL = "codex-spar"
 DEFAULT_CODEX_BIN = "codex"
 DEFAULT_SANDBOX = "read-only"
+EXIT_OUTPUT_MISSING = 123
+EXIT_TIMEOUT = 124
+EXIT_NESTED = 125
+NESTING_ENV = "AGENT_PROCESS_NESTING"
+NESTING_MARKER = "1"
+PROCESS_GROUP_GRACE_SECONDS = 0.25
 
 @dataclass(frozen=True)
 class ModelPreset:
@@ -192,10 +200,11 @@ def _positive_timeout(value: str) -> float:
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agent-process",
-        description="Run one bounded prompt through Codex CLI and exit.",
+        description="Run one bounded prompt through Codex CLI and exit; nested backend runs are rejected.",
         epilog=(
             "MODEL may be codex-spar, luna-max, or any raw Codex model name. "
-            "With no PROMPT, or with PROMPT '-', stdin is used."
+            "With no PROMPT, or with PROMPT '-', stdin is used. "
+            "Nested runs exit 125; timeouts exit 124; missing requested output exits 123."
         ),
     )
     parser.add_argument("prompt", nargs="*", metavar="PROMPT")
@@ -350,35 +359,218 @@ def print_model_recommendations(stream: TextIO) -> None:
     stream.write("\nraw model names -> passed through unchanged with --model\n")
 
 
-def run_process(config: RunConfig, prompt: str) -> int:
-    """Run Codex with inherited output and return its process status."""
+def _timeout_label(timeout: float | None) -> str:
+    return "none" if timeout is None else f"{timeout:g}s"
 
+
+def _emit_diagnostic(
+    config: RunConfig,
+    event: str,
+    *,
+    final_message: str | None = None,
+    returncode: int | None = None,
+) -> None:
+    """Emit bounded failure metadata without copying prompt or source data."""
+
+    fields = (
+        f"event={event}",
+        f"version={VERSION}",
+        f"model={config.model}",
+        f"sandbox={config.sandbox}",
+        f"timeout={_timeout_label(config.timeout)}",
+    )
+    if final_message is not None:
+        fields += (f"final_message={final_message}",)
+    if returncode is not None:
+        fields += (f"returncode={returncode}",)
+    print(f"agent-process: {' '.join(fields)}", file=sys.stderr)
+
+
+def _nested_invocation_detected(environ: Mapping[str, str] | None = None) -> bool:
+    env = os.environ if environ is None else environ
+    return env.get(NESTING_ENV) == NESTING_MARKER
+
+
+def _child_environment() -> dict[str, str]:
+    """Mark the backend environment so a child wrapper can reject recursion."""
+
+    environment = os.environ.copy()
+    environment[NESTING_ENV] = NESTING_MARKER
+    return environment
+
+
+def _popen_options(config: RunConfig) -> dict[str, object]:
+    options: dict[str, object] = {
+        "stdin": subprocess.PIPE,
+        "text": True,
+        "cwd": config.cwd,
+        "env": _child_environment(),
+    }
+    if os.name == "posix":
+        # A fresh session makes the backend and its descendants one owned
+        # process group.  This lets timeout cleanup avoid other agent runs.
+        options["start_new_session"] = True
+    elif hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+        options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    return options
+
+
+def _owned_process_group_id(process: subprocess.Popen[str]) -> int | None:
+    """Return the group created for this run, never the caller's group."""
+
+    if os.name != "posix":
+        return None
     try:
-        completed = subprocess.run(
-            build_command(config),
-            input=prompt,
-            text=True,
-            cwd=config.cwd,
-            check=False,
-            timeout=config.timeout,
-        )
+        process_id = int(process.pid)
+        process_group_id = os.getpgid(process_id)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+    return process_group_id if process_group_id == process_id else None
+
+
+def _process_group_exists(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _wait_for_exit(process: subprocess.Popen[str], timeout: float) -> bool:
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False
+    return True
+
+
+def _terminate_process(process: subprocess.Popen[str]) -> None:
+    """Terminate this run's process group, with a direct-process fallback."""
+
+    process_group_id = _owned_process_group_id(process)
+    if process_group_id is not None:
+        try:
+            os.killpg(process_group_id, signal.SIGTERM)
+        except OSError:
+            pass
+        _wait_for_exit(process, PROCESS_GROUP_GRACE_SECONDS)
+        # The group leader may have exited while a descendant is still alive;
+        # check the group separately before escalating to SIGKILL.
+        if _process_group_exists(process_group_id):
+            try:
+                os.killpg(process_group_id, signal.SIGKILL)
+            except OSError:
+                pass
+        _wait_for_exit(process, PROCESS_GROUP_GRACE_SECONDS)
+        return
+
+    # If ownership cannot be proven, never kill the caller's process group.
+    try:
+        process.terminate()
+    except OSError:
+        return
+    if not _wait_for_exit(process, PROCESS_GROUP_GRACE_SECONDS):
+        try:
+            process.kill()
+        except OSError:
+            return
+        _wait_for_exit(process, PROCESS_GROUP_GRACE_SECONDS)
+
+
+def _close_process_stdin(process: subprocess.Popen[str]) -> None:
+    if process.stdin is None:
+        return
+    try:
+        process.stdin.close()
+    except (OSError, ValueError):
+        pass
+
+
+def _output_snapshot(path: str | None) -> tuple[int, int, int, int, bool] | None:
+    """Capture enough metadata to reject an unchanged, stale output file."""
+
+    if path is None:
+        return None
+    try:
+        output_stat = os.stat(path)
+    except (FileNotFoundError, OSError):
+        return None
+    return (
+        output_stat.st_dev,
+        output_stat.st_ino,
+        output_stat.st_size,
+        output_stat.st_mtime_ns,
+        stat.S_ISREG(output_stat.st_mode),
+    )
+
+
+def _output_is_fresh(path: str, before: tuple[int, int, int, int, bool] | None) -> bool:
+    after = _output_snapshot(path)
+    if after is None or not after[-1]:
+        return False
+    return before is None or after != before
+
+
+def _normal_exit_status(
+    config: RunConfig,
+    returncode: int,
+    output_before: tuple[int, int, int, int, bool] | None,
+) -> int:
+    if returncode != 0 or config.output_last_message is None:
+        if returncode != 0:
+            _emit_diagnostic(
+                config,
+                "backend-exit",
+                final_message="ignored" if config.output_last_message is not None else "not-requested",
+                returncode=returncode,
+            )
+        return returncode
+    if _output_is_fresh(config.output_last_message, output_before):
+        return returncode
+    _emit_diagnostic(config, "output-missing", final_message="absent")
+    return EXIT_OUTPUT_MISSING
+
+
+def run_process(config: RunConfig, prompt: str) -> int:
+    """Run Codex in an owned process group and return a stable shell status."""
+
+    if _nested_invocation_detected():
+        _emit_diagnostic(config, "nested-rejected", final_message="absent")
+        return EXIT_NESTED
+
+    output_before = _output_snapshot(config.output_last_message)
+    try:
+        process = subprocess.Popen(build_command(config), **_popen_options(config))
     except FileNotFoundError:
         print(f"agent-process: Codex executable not found: {config.codex_bin}", file=sys.stderr)
         return 127
     except PermissionError:
         print(f"agent-process: Codex executable is not runnable: {config.codex_bin}", file=sys.stderr)
         return 126
-    except subprocess.TimeoutExpired:
-        seconds = f" after {config.timeout:g}s" if config.timeout is not None else ""
-        print(f"agent-process: timed out{seconds}", file=sys.stderr)
-        return 124
     except OSError as error:
         print(f"agent-process: could not start Codex: {error}", file=sys.stderr)
         return 126
 
-    if completed.returncode < 0:
-        return 128 + (-completed.returncode)
-    return completed.returncode
+    try:
+        process.communicate(input=prompt, timeout=config.timeout)
+    except subprocess.TimeoutExpired:
+        _terminate_process(process)
+        _close_process_stdin(process)
+        _emit_diagnostic(config, "timeout", final_message="absent")
+        return EXIT_TIMEOUT
+
+    returncode = process.returncode
+    if returncode is None:
+        # Popen.communicate() normally waits, but keep mocked/custom Popen
+        # implementations from making the wrapper report a false success.
+        returncode = process.wait()
+    if returncode < 0:
+        returncode = 128 + (-returncode)
+    return _normal_exit_status(config, returncode, output_before)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -393,6 +585,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         config = config_from_args(namespace)
     except ValueError as error:
         parser.error(str(error))
+
+    # Reject before consuming a potentially sensitive prompt or starting a
+    # second backend.  ``run_process`` repeats the check for direct callers.
+    if _nested_invocation_detected():
+        _emit_diagnostic(config, "nested-rejected", final_message="absent")
+        return EXIT_NESTED
 
     prompt = prompt_from_inputs(namespace.prompt, sys.stdin)
     if prompt is None:
