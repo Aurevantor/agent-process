@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent Process"
+  short_description: "Delegate one-shot tasks to configured Codex models"
+  default_prompt: "Use $agent-process to delegate this bounded task to a one-shot Codex model."

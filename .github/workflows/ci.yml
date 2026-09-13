@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Check Python
+        run: python3 --version
+
+      - name: Check executable bit
+        run: test -x ./agent-process
+
+      - name: Run unit tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Compile Python modules
+        run: python3 -m py_compile agent_process.py tests/test_agent_process.py
+
+      - name: Run CLI smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(printf '%s\n' 'ci smoke' | ./agent-process --codex-bin /bin/echo --model luna-max -)"
+          expected='exec --model gpt-5.6-luna --sandbox read-only --skip-git-repo-check --ephemeral --config model_reasoning_effort="max" -'
+          test "$actual" = "$expected"
