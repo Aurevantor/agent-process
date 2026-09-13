@@ -1,0 +1,4 @@
+interface:
+  display_name: "Install Agent Process"
+  short_description: "Install CLI and skills with safe local symlinks"
+  default_prompt: "Use $agent-process-install to install or repair the local agent-process CLI and skill symlinks."
